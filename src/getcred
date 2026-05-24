@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+# getcred: retrieves credentials from a password manager and outputs them in
+# formats useful for scripting (NetworkManager config files, SSID lists, etc.).
+# The password manager backend is abstracted so it can be swapped out without
+# touching the credential-type classes.
+
+import sys
+import os
+import json
+import subprocess
+import hashlib
+import argparse
+import argcomplete
+from abc import ABC, abstractmethod
+
+# Bitwarden folder names that hold the respective credential items.
+WIFI_FOLDER_NAME = "AutoInstaller WiFi"
+WIREGUARD_FOLDER_NAME = "AutoInstaller WireGuard"
+
+
+# ---------------------------------------------------------------------------
+# Password manager backend abstraction
+# ---------------------------------------------------------------------------
+
+
+# Abstract base class so the rest of the code never calls bitwarden directly.
+# Swapping to a different password manager only requires a new subclass here.
+class PasswordManagerBackend(ABC):
+    @abstractmethod
+    def get_items_in_folder(self, folder_name: str) -> list[dict]:
+        """Return all items in the named folder as a list of raw dicts."""
+        ...
+
+
+class BitwardenBackend(PasswordManagerBackend):
+    def _ensure_unlocked(self):
+        # bw-login-and-unlock logs in / unlocks and writes the session token to
+        # ~/.bw_session. We re-read it here so subsequent bw calls pick it up
+        # via BW_SESSION without requiring the user to export it manually.
+        subprocess.run(["bw-login-and-unlock"], check=True)
+        session_file = os.path.expanduser("~/.bw_session")
+        if os.path.exists(session_file):
+            with open(session_file) as f:
+                os.environ["BW_SESSION"] = f.read().strip()
+
+    def _bw(self, args: list[str]) -> str:
+        result = subprocess.run(
+            ["bw"] + args,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    def get_items_in_folder(self, folder_name: str) -> list[dict]:
+        self._ensure_unlocked()
+        folders = json.loads(self._bw(["list", "folders"]))
+        folder_id = next((f["id"] for f in folders if f["name"] == folder_name), None)
+        if folder_id is None:
+            raise ValueError(f"Folder '{folder_name}' not found in Bitwarden")
+        return json.loads(self._bw(["list", "items", "--folderid", folder_id]))
+
+
+# ---------------------------------------------------------------------------
+# WiFi credentials
+# ---------------------------------------------------------------------------
+
+
+# Derives a stable UUID from the item name so NetworkManager always sees the
+# same UUID for a given connection, even after regenerating the config file.
+def _make_uuid(name: str) -> str:
+    md5 = hashlib.md5(name.encode()).hexdigest()
+    return "-".join(md5[o : o + l] for o, l in [(0, 8), (8, 4), (12, 4), (16, 4), (20, 12)])
+
+
+# Credential items store their configuration in the Bitwarden notes field as
+# newline-separated "Key=Value" pairs. This parses that format into a dict.
+def _parse_notes(notes: str) -> dict:
+    result = {}
+    for line in (notes or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("=", 1)
+        if len(parts) == 2:
+            result[parts[0].strip()] = parts[1].strip()
+    return result
+
+
+class WifiCredentials:
+    def __init__(self, backend: PasswordManagerBackend):
+        self._backend = backend
+        self._items: list[dict] | None = None
+
+    def _get_items(self) -> list[dict]:
+        if self._items is None:
+            raw = self._backend.get_items_in_folder(WIFI_FOLDER_NAME)
+            self._items = []
+            for item in raw:
+                # Defaults are set here; notes fields override them.
+                opts = {
+                    "Name": item["name"],
+                    "Type": "wpa-psk",
+                    "Autoconnect": "true",
+                    "ignore": "false",
+                }
+                opts.update(_parse_notes(item.get("notes", "")))
+                # Items with ignore=true stay in the vault but are skipped,
+                # useful for temporarily disabling a network without deleting it.
+                if opts["ignore"].lower() != "true":
+                    self._items.append(opts)
+        return self._items
+
+    def list_ssids(self):
+        for item in self._get_items():
+            print(item["Name"])
+
+    def ssid_pw_list(self):
+        for item in self._get_items():
+            print(f"{item['Name']}:{item['Password']}")
+
+    def get_password(self, ssid: str):
+        item = next((i for i in self._get_items() if i["Name"] == ssid), None)
+        if item is None:
+            print(f"Error: SSID '{ssid}' not found", file=sys.stderr)
+            sys.exit(1)
+        print(item["Password"], end="")
+
+    def generate_nm_config(self, ssid: str):
+        items = self._get_items()
+        item = next((i for i in items if i["Name"] == ssid), None)
+        if item is None:
+            print(f"Error: SSID '{ssid}' not found", file=sys.stderr)
+            sys.exit(1)
+        wifi_type = item["Type"]
+        if wifi_type == "wpa-psk":
+            print(self._nm_config_wpa_psk(item), end="")
+        elif wifi_type == "wpa-eap":
+            print(self._nm_config_wpa_eap(item), end="")
+        else:
+            print(f"Error: unknown WiFi type '{wifi_type}'", file=sys.stderr)
+            sys.exit(1)
+
+    def generate_netplan_config(self, ssid: str):
+        items = self._get_items()
+        item = next((i for i in items if i["Name"] == ssid), None)
+        if item is None:
+            print(f"Error: SSID '{ssid}' not found", file=sys.stderr)
+            sys.exit(1)
+        wifi_type = item["Type"]
+        if wifi_type == "wpa-psk":
+            print(self._netplan_config_wpa_psk(item), end="")
+        elif wifi_type == "wpa-eap":
+            print(self._netplan_config_wpa_eap(item), end="")
+        else:
+            print(f"Error: unknown WiFi type '{wifi_type}'", file=sys.stderr)
+            sys.exit(1)
+
+    @staticmethod
+    def _netplan_config_wpa_psk(opts: dict) -> str:
+        name = opts["Name"]
+        return (
+            f"network:\n"
+            f"  version: 2\n"
+            f"  wifis:\n"
+            f"    any-wifi:\n"
+            f"      match:\n"
+            f'        name: "wl*"\n'
+            f"      access-points:\n"
+            f'        "{name}":\n'
+            f'          password: "{opts["Password"]}"\n'
+            f"      dhcp4: true\n"
+            f"      dhcp6: true\n"
+        )
+
+    @staticmethod
+    def _netplan_config_wpa_eap(opts: dict) -> str:
+        name = opts["Name"]
+        return (
+            f"network:\n"
+            f"  version: 2\n"
+            f"  wifis:\n"
+            f"    any-wifi:\n"
+            f"      match:\n"
+            f'        name: "wl*"\n'
+            f"      access-points:\n"
+            f'        "{name}":\n'
+            f"          auth:\n"
+            f"            key-management: eap\n"
+            f"            method: peap\n"
+            f'            identity: "{opts["Username"]}"\n'
+            f'            password: "{opts["Password"]}"\n'
+            f"            phase2-auth: mschapv2\n"
+            f"      dhcp4: true\n"
+            f"      dhcp6: true\n"
+        )
+
+    @staticmethod
+    def _nm_config_wpa_psk(opts: dict) -> str:
+        name = opts["Name"]
+        uuid = _make_uuid(name)
+        return (
+            f"[connection]\n"
+            f"id={name}\n"
+            f"uuid={uuid}\n"
+            f"type=wifi\n"
+            f"autoconnect={opts['Autoconnect']}\n"
+            f"\n"
+            f"[wifi]\n"
+            f"mode=infrastructure\n"
+            f"ssid={name}\n"
+            f"\n"
+            f"[wifi-security]\n"
+            f"auth-alg=open\n"
+            f"key-mgmt=wpa-psk\n"
+            f"psk={opts['Password']}\n"
+            f"\n"
+            f"[ipv4]\n"
+            f"method=auto\n"
+            f"\n"
+            f"[ipv6]\n"
+            f"addr-gen-mode=stable-privacy\n"
+            f"method=auto\n"
+        )
+
+    @staticmethod
+    def _nm_config_wpa_eap(opts: dict) -> str:
+        name = opts["Name"]
+        uuid = _make_uuid(name)
+        return (
+            f"[connection]\n"
+            f"id={name}\n"
+            f"uuid={uuid}\n"
+            f"type=wifi\n"
+            f"autoconnect={opts['Autoconnect']}\n"
+            f"\n"
+            f"[wifi]\n"
+            f"mode=infrastructure\n"
+            f"ssid={name}\n"
+            f"\n"
+            f"[wifi-security]\n"
+            f"key-mgmt=wpa-eap\n"
+            f"\n"
+            f"[802-1x]\n"
+            f"eap=peap;\n"
+            f"identity={opts['Username']}\n"
+            f"password={opts['Password']}\n"
+            f"phase2-auth=mschapv2\n"
+            f"\n"
+            f"[ipv4]\n"
+            f"method=auto\n"
+            f"\n"
+            f"[ipv6]\n"
+            f"addr-gen-mode=stable-privacy\n"
+            f"method=ignore\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# WireGuard credentials
+# ---------------------------------------------------------------------------
+
+
+class WireguardCredentials:
+    def __init__(self, backend: PasswordManagerBackend):
+        self._backend = backend
+        self._items: list[dict] | None = None
+        self._defaults: dict[str, dict] | None = None
+
+    def _get_items(self) -> list[dict]:
+        if self._items is None:
+            raw = self._backend.get_items_in_folder(WIREGUARD_FOLDER_NAME)
+
+            # Items whose name ends with "---defaults" are not real profiles;
+            # they supply fallback key=value pairs for all profiles of a given
+            # VPN type (e.g. "vpn---defaults" sets defaults for Type=vpn).
+            defaults: dict[str, dict] = {}
+            pending: list[tuple[str, str]] = []
+            for item in raw:
+                name = item["name"]
+                notes = item.get("notes", "")
+                if name.endswith("---defaults"):
+                    vpn_type = name[: -len("---defaults")]
+                    defaults[vpn_type] = _parse_notes(notes)
+                else:
+                    pending.append((name, notes))
+
+            # Persist so generate_server_config can access raw defaults for
+            # the AllowedIPs filtering logic without re-fetching from the vault.
+            self._defaults = defaults
+
+            self._items = []
+            for name, notes in pending:
+                parsed = _parse_notes(notes)
+                vpn_type = parsed.get("Type", "")
+                opts = {"Name": name, "Autoconnect": "true"}
+                # Vault type defaults override the hardcoded baseline; item notes
+                # override vault defaults.
+                opts.update(defaults.get(vpn_type, {}))
+                opts.update(parsed)
+                self._items.append(opts)
+
+        return self._items
+
+    def list_profiles(self):
+        for item in self._get_items():
+            print(item["Name"])
+
+    def generate_nm_config(self, name: str):
+        items = self._get_items()
+        item = next((i for i in items if i["Name"] == name), None)
+        if item is None:
+            print(f"Error: WireGuard profile '{name}' not found", file=sys.stderr)
+            sys.exit(1)
+        print(self._nm_config(item), end="")
+
+    def generate_wg_quick_config(self, name: str):
+        item = next((i for i in self._get_items() if i["Name"] == name), None)
+        if item is None:
+            print(f"Error: WireGuard profile '{name}' not found", file=sys.stderr)
+            sys.exit(1)
+        print(self._wg_quick_config(item), end="")
+
+    def generate_server_config(self, vpn_type: str):
+        items = [i for i in self._get_items() if i.get("Type") == vpn_type]
+        if not items:
+            print(f"Error: no WireGuard profiles found for type '{vpn_type}'", file=sys.stderr)
+            sys.exit(1)
+        servers = [i for i in items if i.get("isServer", "false").lower() == "true"]
+        if len(servers) != 1:
+            print(f"Error: expected exactly 1 server for type '{vpn_type}', found {len(servers)}", file=sys.stderr)
+            sys.exit(1)
+        server = servers[0]
+        peers = [i for i in items if i is not server]
+        server_field = self._defaults.get(vpn_type, {}).get("Server", "")
+        if ":" not in server_field:
+            print(f"Error: 'Server' in '{vpn_type}---defaults' must be 'host:port'", file=sys.stderr)
+            sys.exit(1)
+        listen_port = server_field.rsplit(":", 1)[-1]
+        print(self._server_config_str(server, peers, listen_port), end="")
+
+    def generate_hosts_file(self, vpn_type: str):
+        items = [i for i in self._get_items() if i.get("Type") == vpn_type]
+        if not items:
+            print(f"Error: no WireGuard profiles found for type '{vpn_type}'", file=sys.stderr)
+            sys.exit(1)
+        print(self._hosts_content_str(items), end="")
+
+    @staticmethod
+    def _derive_public_key(private_key: str) -> str:
+        result = subprocess.run(
+            ["wg", "pubkey"],
+            input=private_key, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    @staticmethod
+    def _server_config_str(server: dict, peers: list[dict], listen_port: str) -> str:
+        addr = server["Address"]
+        lines = [
+            "[Interface]",
+            f"Address = {addr}/24",
+            "SaveConfig = true",
+            f"PrivateKey = {server['Key']}",
+            f"ListenPort = {listen_port}",
+        ]
+        for peer in peers:
+            pubkey = WireguardCredentials._derive_public_key(peer["Key"])
+            lines += [
+                "",
+                f"# {peer['Name']}",
+                "[Peer]",
+                f"PublicKey = {pubkey}",
+                f"AllowedIPs = {peer['Address']}/32",
+            ]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _hosts_content_str(nodes: list[dict]) -> str:
+        return "".join(f"{n['Address']} {n['Hostname']}.vpn\n" for n in nodes)
+
+    @staticmethod
+    def _wg_quick_config(opts: dict) -> str:
+        # NM stores AllowedIPs as semicolon-separated; wg-quick needs commas.
+        allowed_ips = ','.join(ip.strip() for ip in opts['AllowedIPs'].split(';') if ip.strip())
+        return (
+            f"[Interface]\n"
+            f"PrivateKey = {opts['Key']}\n"
+            f"Address = {opts['Address']}/32\n"
+            f"DNS = {opts['DNS']}\n"
+            f"\n"
+            f"[Peer]\n"
+            f"PublicKey = {opts['ServerPubKey']}\n"
+            f"Endpoint = {opts['Server']}\n"
+            f"AllowedIPs = {allowed_ips}\n"
+            f"PersistentKeepalive = 21\n"
+        )
+
+    def generate_netplan_config(self, name: str):
+        item = next((i for i in self._get_items() if i["Name"] == name), None)
+        if item is None:
+            print(f"Error: WireGuard profile '{name}' not found", file=sys.stderr)
+            sys.exit(1)
+        print(self._netplan_config_np(item), end="")
+
+    @staticmethod
+    def _netplan_config_np(opts: dict) -> str:
+        name = opts["Name"]
+        iface = f"{opts['Type']}-{opts['Hostname']}"
+        uuid = _make_uuid(name)
+        pubkey = opts["ServerPubKey"]
+        dns_addrs = [a.strip() for a in opts["DNS"].split(";") if a.strip()]
+        dns_addr_lines = "\n".join(f"        - {a}" for a in dns_addrs)
+        allowed_ips = [ip.strip() for ip in opts["AllowedIPs"].split(";") if ip.strip()]
+        ip_lines = "\n".join(f'        - "{ip}"' for ip in allowed_ips)
+        return (
+            f"network:\n"
+            f"  version: 2\n"
+            f"  tunnels:\n"
+            f"    {iface}:\n"
+            f"      renderer: NetworkManager\n"
+            f"      addresses:\n"
+            f'      - "{opts["Address"]}/32"\n'
+            f"      nameservers:\n"
+            f"        addresses:\n"
+            f"{dns_addr_lines}\n"
+            f'      ipv6-address-generation: "stable-privacy"\n'
+            f'      mode: "wireguard"\n'
+            f"      keys:\n"
+            f'        private: "{opts["Key"]}"\n'
+            f"      peers:\n"
+            f'      - endpoint: "{opts["Server"]}"\n'
+            f"        keys:\n"
+            f'          public: "{pubkey}"\n'
+            f"        allowed-ips:\n"
+            f"{ip_lines}\n"
+            f"      networkmanager:\n"
+            f'        uuid: "{uuid}"\n'
+            f'        name: "{name}"\n'
+            f"        passthrough:\n"
+            f'          wireguard-peer.{pubkey}.persistent-keepalive: "21"\n'
+            f'          ipv4.dns-priority: "{opts["DNSPriority"]}"\n'
+            f'          ipv4.dns-search: "{opts["DNSSearch"]}"\n'
+            f'          ipv6.dns-priority: "-50"\n'
+            f'          ipv6.method: "disabled"\n'
+            f'          proxy._: ""\n'
+        )
+
+    @staticmethod
+    def _nm_config(opts: dict) -> str:
+        name = opts["Name"]
+        uuid = _make_uuid(name)
+        hostname = opts["Hostname"]
+        vpn_type = opts["Type"]
+        # interface-name follows the convention "<type>-<hostname>" so multiple
+        # WireGuard tunnels on the same host get distinct interface names.
+        return (
+            f"[connection]\n"
+            f"id={name}\n"
+            f"uuid={uuid}\n"
+            f"type=wireguard\n"
+            f"interface-name={vpn_type}-{hostname}\n"
+            f"autoconnect={opts['Autoconnect']}\n"
+            f"\n"
+            f"[wireguard]\n"
+            f"private-key={opts['Key']}\n"
+            f"\n"
+            f"[wireguard-peer.{opts['ServerPubKey']}]\n"
+            f"endpoint={opts['Server']}\n"
+            f"persistent-keepalive=21\n"
+            f"allowed-ips={opts['AllowedIPs']}\n"
+            f"\n"
+            f"[ipv4]\n"
+            f"address1={opts['Address']}/32\n"
+            f"dns-search={opts['DNSSearch']}\n"
+            f"method=manual\n"
+            f"dns={opts['DNS']}\n"
+            f"dns-priority={opts['DNSPriority']}\n"
+            f"\n"
+            f"[ipv6]\n"
+            f"addr-gen-mode=stable-privacy\n"
+            f"dns-priority=-50\n"
+            f"dns-search=\n"
+            f"ip6-privacy=0\n"
+            f"method=disabled\n"
+            f"\n"
+            f"[proxy]\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="getcred: retrieve credentials from a password manager")
+    subparsers = parser.add_subparsers(dest="category", required=True)
+
+    wifi_parser = subparsers.add_parser("wifi", help="WiFi credential operations")
+    wifi_sub = wifi_parser.add_subparsers(dest="command", required=True)
+
+    wifi_sub.add_parser("list", help="List SSIDs, one per line")
+    wifi_sub.add_parser("ssid-pw-list", help="List SSID:password pairs, one per line")
+    wifi_getpw = wifi_sub.add_parser("get-pw", help="Print the password for the given SSID")
+    wifi_getpw.add_argument("ssid", help="The SSID to look up")
+    wifi_gen = wifi_sub.add_parser(
+        "generate-nm-config",
+        help="Print a NetworkManager config file for the given SSID",
+    )
+    wifi_gen.add_argument("ssid", help="The SSID to generate a config for")
+    wifi_netplan = wifi_sub.add_parser(
+        "generate-netplan-config",
+        help="Print a netplan config file for the given SSID",
+    )
+    wifi_netplan.add_argument("ssid", help="The SSID to generate a config for")
+
+    wg_parser = subparsers.add_parser("wireguard", help="WireGuard credential operations")
+    wg_sub = wg_parser.add_subparsers(dest="command", required=True)
+
+    wg_sub.add_parser("list", help="List WireGuard profiles for this host, one per line")
+    wg_gen = wg_sub.add_parser(
+        "generate-nm-config",
+        help="Print a NetworkManager config file for the given WireGuard profile",
+    )
+    wg_gen.add_argument("name", help="The profile name to generate a config for")
+    wg_netplan = wg_sub.add_parser(
+        "generate-netplan-config",
+        help="Print a netplan config file for the given WireGuard profile",
+    )
+    wg_netplan.add_argument("name", help="The profile name to generate a config for")
+    wg_wgquick = wg_sub.add_parser(
+        "generate-wg-quick-config",
+        help="Print a wg-quick config file for the given WireGuard profile",
+    )
+    wg_wgquick.add_argument("name", help="The profile name to generate a config for")
+    wg_srvcfg = wg_sub.add_parser(
+        "generate-server-config",
+        help="Print a wg-quick server config for all peers of the given VPN type",
+    )
+    wg_srvcfg.add_argument("type", help="The VPN type (e.g. nexus)")
+    wg_hosts = wg_sub.add_parser(
+        "generate-hosts-file",
+        help="Print a hosts.extra file for all peers of the given VPN type",
+    )
+    wg_hosts.add_argument("type", help="The VPN type (e.g. nexus)")
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    backend = BitwardenBackend()
+
+    if args.category == "wifi":
+        wifi = WifiCredentials(backend)
+        if args.command == "list":
+            wifi.list_ssids()
+        elif args.command == "ssid-pw-list":
+            wifi.ssid_pw_list()
+        elif args.command == "get-pw":
+            wifi.get_password(args.ssid)
+        elif args.command == "generate-nm-config":
+            wifi.generate_nm_config(args.ssid)
+        elif args.command == "generate-netplan-config":
+            wifi.generate_netplan_config(args.ssid)
+    elif args.category == "wireguard":
+        wg = WireguardCredentials(backend)
+        if args.command == "list":
+            wg.list_profiles()
+        elif args.command == "generate-nm-config":
+            wg.generate_nm_config(args.name)
+        elif args.command == "generate-netplan-config":
+            wg.generate_netplan_config(args.name)
+        elif args.command == "generate-wg-quick-config":
+            wg.generate_wg_quick_config(args.name)
+        elif args.command == "generate-server-config":
+            wg.generate_server_config(args.type)
+        elif args.command == "generate-hosts-file":
+            wg.generate_hosts_file(args.type)
+
+
+if __name__ == "__main__":
+    main()

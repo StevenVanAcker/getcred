@@ -1,0 +1,46 @@
+#!/bin/bash -e
+
+# This script is used to ensure that bitwarden is logged in and unlocked.
+
+# Check if bitwarden is installed
+if ! command -v bw &> /dev/null; then
+    echo "Bitwarden is not installed. Please install it first."
+    exit 1
+fi
+
+if [ ! -e "$HOME/.getcred/login.txt" ]; then
+    echo "No login information found. Please create $HOME/.getcred/login.txt with your Bitwarden email."
+    exit 1
+fi
+
+BW_ACCOUNT=$(cat ~/.getcred/login.txt)
+SESSION_FILE=~/.bw_session
+
+if [ -e "$SESSION_FILE" ]; then
+    export BW_SESSION=$(cat "$SESSION_FILE")
+fi
+
+status=$(bw status | jq -r .status)
+writeSession=false
+
+while [ "$status" != "unlocked" ]; do
+    status=$(bw status | jq -r .status)
+    echo "Status = $status"
+    if [ "$status" == "unauthenticated" ]; then
+        echo "Logging in $BW_ACCOUNT..."
+        export BW_SESSION=$(bw login $BW_ACCOUNT --raw)
+        writeSession=true
+    elif [ "$status" == "locked" ]; then
+        echo "Unlocking $BW_ACCOUNT..."
+        export BW_SESSION=$(bw unlock --raw)
+        writeSession=true
+    fi
+done
+
+if [ "$writeSession" = "true" ]; then
+    echo "Writing session to $SESSION_FILE"
+    echo "$BW_SESSION" > "$SESSION_FILE"
+    chmod go= "$SESSION_FILE"
+fi
+
+exit 0
