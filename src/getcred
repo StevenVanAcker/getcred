@@ -294,7 +294,7 @@ class WireguardCredentials:
             for name, notes in pending:
                 parsed = _parse_notes(notes)
                 vpn_type = parsed.get("Type", "")
-                opts = {"Name": name, "Autoconnect": "true"}
+                opts = {"Name": name, "Autoconnect": "true", "RouteMetric": "1000"}
                 # Vault type defaults override the hardcoded baseline; item notes
                 # override vault defaults.
                 opts.update(defaults.get(vpn_type, {}))
@@ -425,6 +425,8 @@ class WireguardCredentials:
             f"      nameservers:\n"
             f"        addresses:\n"
             f"{dns_addr_lines}\n"
+            f"      dhcp4-overrides:\n"
+            f"        route-metric: {opts['RouteMetric']}\n"
             f'      ipv6-address-generation: "stable-privacy"\n'
             f'      mode: "wireguard"\n'
             f"      keys:\n"
@@ -477,6 +479,7 @@ class WireguardCredentials:
             f"method=manual\n"
             f"dns={opts['DNS']}\n"
             f"dns-priority={opts['DNSPriority']}\n"
+            f"route-metric={opts['RouteMetric']}\n"
             f"\n"
             f"[ipv6]\n"
             f"addr-gen-mode=stable-privacy\n"
