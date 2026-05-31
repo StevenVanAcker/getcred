@@ -384,11 +384,18 @@ class WireguardCredentials:
     def _wg_quick_config(opts: dict) -> str:
         # NM stores AllowedIPs as semicolon-separated; wg-quick needs commas.
         allowed_ips = ','.join(ip.strip() for ip in opts['AllowedIPs'].split(';') if ip.strip())
+        dns_server = opts['DNS']
+        dns_search = opts.get('DNSSearch', '')
+        if dns_search:
+            # systemd-resolved routing domain: queries for dns_search go to dns_server only.
+            dns_line = f"{dns_server}~{dns_search}"
+        else:
+            dns_line = dns_server
         return (
             f"[Interface]\n"
             f"PrivateKey = {opts['Key']}\n"
             f"Address = {opts['Address']}/32\n"
-            f"DNS = {opts['DNS']}\n"
+            f"DNS = {dns_line}\n"
             f"\n"
             f"[Peer]\n"
             f"PublicKey = {opts['ServerPubKey']}\n"
